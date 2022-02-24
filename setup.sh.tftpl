@@ -1,0 +1,79 @@
+#!/bin/bash
+
+SERVERS_SG_NAME=${servers_asg_name}
+REGION=${aws_region}
+EXPECTED_SIZE=${cluster_size}
+IS_SERVER=${is_server_node}
+
+# Fonction returns of list of id of all instances of the cluster
+function get-cluster-instances-id {
+  ASG_FULL_NAME=$(aws --region="$${REGION}" autoscaling describe-auto-scaling-groups --query 'AutoScalingGroups[].[AutoScalingGroupName]' | grep "$${SERVERS_SG_NAME}" | tr -d '"')
+  aws --region="$${REGION}" autoscaling describe-auto-scaling-groups --auto-scaling-group-name $${ASG_FULL_NAME} | grep InstanceId | cut -d '"' -f4
+}
+
+# Fonction returns the private IP of each instance in the cluster, will be iused by consul to join the cluster
+function get-all-cluster-ips {
+  for instance_id in $(get-cluster-instances-id )
+  do
+    aws --region="$${REGION}" ec2 describe-instances --query="Reservations[].Instances[].[PrivateIpAddress]" --output="text" --instance-ids="$${instance_id}"
+  done
+}
+
+# Wait for NAT gateway, might take some time...
+while ! ping -c 1 8.8.8.8 &> /dev/null; do echo "No internet access. Will wait for 5 secs before next attempt..."; sleep 5; done
+
+sudo apt-get update
+
+# Install aws cli
+[ -z "$(which aws)" ] && sudo apt-get install awscli -y
+
+# Install docker
+[ -z "$(which docker)" ] && {
+  sudo apt-get install ca-certificates curl gnupg lsb-release -y
+  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
+  echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+  sudo apt-get update
+  sudo apt-get install docker-ce docker-ce-cli containerd.io -y
+}
+
+# Install hashi-up
+[ -z "$(which hashi-up)" ] && curl -sLS https://get.hashi-up.dev | sh
+
+# wiat for the auto scling group to launch expected instances number
+while COUNT=$(get-cluster-instances-id | wc -l) && [ "$${COUNT}" -lt "$${EXPECTED_SIZE}" ]
+do
+    echo "$${COUNT} instances in the cluster now, waiting for expected cluster instances : $${EXPECTED_SIZE} "
+    sleep 1
+done
+
+# Get my local IP address
+LOCAL_IP=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
+
+# Get All the IPS of this region ( cluster IP and all EC2 instances IP running )
+mapfile -t ALL_IPS < <(get-all-cluster-ips)
+
+# OTHER_IPS=( $${ALL_IPS[@]/$${LOCAL_IP}} )
+
+[ -f /tmp/hashi_key ] || {
+  ssh-keygen -b 2048 -t rsa -f /tmp/hashi_key -q -N "" && chmod 600 /tmp/hashi_key
+  echo $(cat /tmp/hashi_key.pub) >> /home/ubuntu/.ssh/authorized_keys
+}
+
+# compute hashi-up command
+install_consul=("hashi-up" "consul" "install" "--ssh-target-addr" "$${LOCAL_IP}" "--ssh-target-user" "ubuntu" "--ssh-target-key" "/tmp/hashi_key")
+install_nomad=("hashi-up" "nomad" "install" "--ssh-target-addr" "$${LOCAL_IP}" "--ssh-target-user" "ubuntu" "--ssh-target-key" "/tmp/hashi_key")
+if $${IS_SERVER}; then
+  install_consul+=("--server" "--client-addr" "0.0.0.0" "--bootstrap-expect" "$${EXPECTED_SIZE}")
+  install_nomad+=("--server" "--bootstrap-expect" "$${EXPECTED_SIZE}")
+else
+  install_nomad+=("--client")
+fi
+# specify clusters members
+for server in "$${ALL_IPS[@]}"; do
+  install_consul+=("--retry-join" "$${server}")
+  install_nomad+=("--retry-join" "$${server}")
+done
+
+# Launch commands...
+"$${install_consul[@]}"
+"$${install_nomad[@]}"
